@@ -42,7 +42,7 @@ def compute_fidelity_from_explanations(model, x_sample, explanation_values, expl
         fidelity = 1.0 if orig_binary == exp_binary else 0.0
     
     return float(fidelity)
-
+    
 
 def compute_model_parameter_randomization(model_predict_func, x_sample, explanation_function,
                                         trained_model=None, model_type='auto',
@@ -335,33 +335,7 @@ def compute_model_parameter_randomization(model_predict_func, x_sample, explanat
         return float('nan')
 
 
-def compute_model_parameter_randomization(model_predict_func, x_sample, explanation_function,
-                                        trained_model, create_random_model_func,
-                                        similarity_metric='spearman_abs', random_seed=42):
-    """
-    TRUE implementation based on paper's Definition
-    
-    Parameters:
-    -----------
-    trained_model : Your actual trained LSTM model
-    create_random_model_func : Function that creates same architecture with random weights
-    """
-    
-    # 1. Get explanation from trained model
-    original_explanation = explanation_function(trained_model, x_sample)
-    
-    # 2. Create randomly initialized model with SAME architecture
-    random_model = create_random_model_func()
-    
-    # 3. Get explanation from random model using SAME method
-    random_explanation = explanation_function(random_model, x_sample)
-    
-    # 4. Compare similarities
-    similarity = compute_similarity(original_explanation, random_explanation)
-    
-    return similarity
-
-def compute_feature_mutual_information(model, test_samples, explanation_function, 
+def compute_feature_mutual_information1(model, test_samples, explanation_function, 
                                      threshold=0.1, n_bins=10, epsilon_min=1e-8):
     """
     Compute Feature Mutual Information I(X, Z) for XAI explanation methods on tabular data.
@@ -441,8 +415,97 @@ def compute_feature_mutual_information(model, test_samples, explanation_function
     return feature_mi
 
 
+def compute_feature_mutual_information(original_features, extracted_features, 
+                                               n_bins=10, epsilon_min=1e-8):
+    """
+    Compute Feature Mutual Information I(X, Z) as defined in the paper.
+    
+    Measures information preservation between original feature space (X) 
+    and extracted/transformed feature space (Z).
+    
+    Parameters:
+    -----------
+    original_features : np.ndarray
+        Original input features X (shape: [n_samples, n_original_features])
+    extracted_features : np.ndarray  
+        Extracted/transformed features Z (shape: [n_samples, n_extracted_features])
+        Could be from discretization, superpixels, PCA, etc.
+    n_bins : int, default=10
+        Number of bins for discretizing continuous variables
+    epsilon_min : float, default=1e-8
+        Minimum value to prevent numerical issues
+        
+    Returns:
+    --------
+    float : Feature mutual information I(X, Z)
+    """
+    import numpy as np
+    from sklearn.feature_selection import mutual_info_regression
+    from sklearn.preprocessing import KBinsDiscretizer
+    
+    X = np.array(original_features)
+    Z = np.array(extracted_features)
+    
+    # Discretize continuous features if needed
+    if len(np.unique(X.flatten())) > n_bins:
+        discretizer_X = KBinsDiscretizer(n_bins=n_bins, encode='ordinal', strategy='uniform')
+        X_discrete = discretizer_X.fit_transform(X)
+    else:
+        X_discrete = X
+    
+    if len(np.unique(Z.flatten())) > n_bins:
+        discretizer_Z = KBinsDiscretizer(n_bins=n_bins, encode='ordinal', strategy='uniform')
+        Z_discrete = discretizer_Z.fit_transform(Z)
+    else:
+        Z_discrete = Z
+    
+    # Compute mutual information between X and Z
+    # Average MI across all feature pairs
+    mi_scores = []
+    
+    for i in range(X_discrete.shape[1]):
+        for j in range(Z_discrete.shape[1]):
+            mi = mutual_info_regression(X_discrete[:, i].reshape(-1, 1), 
+                                      Z_discrete[:, j])
+            mi_scores.append(mi[0])
+    
+    # Return average mutual information
+    return float(np.mean(mi_scores))
 
 
+def compute_explanation_attribution_mutual_information(original_features, explanations, 
+                                                     n_bins=10):
+    """
+    Alternative: Compute MI between original features and explanation attributions.
+    
+    This measures how much the explanation attributions preserve information
+    about the original input features.
+    """
+    import numpy as np
+    from sklearn.feature_selection import mutual_info_regression
+    from sklearn.preprocessing import KBinsDiscretizer
+    
+    X = np.array(original_features)
+    explanations = np.array(explanations)
+    
+    # Discretize original features if needed
+    if len(np.unique(X.flatten())) > n_bins:
+        discretizer = KBinsDiscretizer(n_bins=n_bins, encode='ordinal', strategy='uniform')
+        X_discrete = discretizer.fit_transform(X)
+    else:
+        X_discrete = X
+    
+    # Compute MI between original features and their corresponding attributions
+    mi_scores = []
+    
+    for i in range(min(X_discrete.shape[1], explanations.shape[1])):
+        x_feature = X_discrete[:, i]
+        attr_feature = explanations[:, i]
+        
+        mi = mutual_info_regression(x_feature.reshape(-1, 1), attr_feature)
+        mi_scores.append(mi[0])
+    
+    return float(np.mean(mi_scores))
 
 
 def compute_diversity(model, test_samples, explanation_function, distance_metric='euclidean', 
@@ -862,100 +925,7 @@ def compute_relative_output_stability(model, x_sample, explanation_function,
     return float(max_instability)
 
 
-
 def compute_relative_representation_stability1(model, x_sample, explanation_function,
-                                            representation_layer, n_samples=20,
-                                            noise_std=0.05, epsilon_min=1e-8, p_norm=2):
-    """
-    Compute Relative Representation Stability (RRS) according to Equation 3.
-
-    RRS = max ||(ex'-ex)/ex||_p / max(||(Lx'-Lx)/Lx||_p, ε_min)
-    where L(·) denotes internal model representation (e.g., hidden layer outputs)
-
-    Parameters:
-    -----------
-    model : Callable
-        Model prediction function
-    x_sample : np.ndarray
-        Original input sample (1D array)
-    explanation_function : Callable
-        Function that generates explanations for inputs
-    representation_layer : Callable
-        Function that extracts internal representations L(x) from the model
-        Should take input and return the internal representation (e.g., hidden layer output)
-    n_samples : int, default=20
-        Number of perturbation samples
-    noise_std : float, default=0.05
-        Standard deviation for perturbations
-    epsilon_min : float, default=1e-8
-        Minimum value to prevent division by zero
-    p_norm : int, default=2
-        Which p-norm to use for distance calculations
-
-    Returns:
-    --------
-    float : RRS score (lower is better, indicates more stable explanations)
-    """
-    x_sample = np.array(x_sample).flatten()
-
-    # Get original explanation and representation
-    original_explanation = np.array(explanation_function(x_sample)).flatten()
-    original_representation = np.array(representation_layer(x_sample)).flatten()
-
-    # Generate perturbations with same prediction
-    valid_perturbations = []
-    original_pred = np.argmax(model(x_sample.reshape(1, -1))[0])
-
-    attempts = 0
-    max_attempts = n_samples * 10
-
-    while len(valid_perturbations) < n_samples and attempts < max_attempts:
-        perturbation = np.random.normal(0, noise_std, x_sample.shape)
-        x_perturbed = x_sample + perturbation
-
-        # Check if prediction class is the same
-        perturbed_pred = np.argmax(model(x_perturbed.reshape(1, -1))[0])
-
-        if perturbed_pred == original_pred:
-            # Get representation for perturbed input
-            perturbed_representation = np.array(representation_layer(x_perturbed)).flatten()
-            valid_perturbations.append((x_perturbed, perturbed_representation))
-
-        attempts += 1
-
-    if len(valid_perturbations) == 0:
-        return 0.0
-
-    max_instability = 0.0
-
-    for x_perturbed, perturbed_representation in valid_perturbations:
-        # Get explanation for perturbed input
-        perturbed_explanation = np.array(explanation_function(x_perturbed)).flatten()
-
-        # Compute (ex' - ex) / ex
-        explanation_diff = perturbed_explanation - original_explanation
-        safe_original_exp = np.where(np.abs(original_explanation) < epsilon_min,
-                                   epsilon_min, original_explanation)
-        explanation_relative = explanation_diff / safe_original_exp
-
-        # Compute (Lx' - Lx) / Lx
-        representation_diff = perturbed_representation - original_representation
-        safe_original_repr = np.where(np.abs(original_representation) < epsilon_min,
-                                    epsilon_min, original_representation)
-        representation_relative = representation_diff / safe_original_repr
-
-        # Compute norms of the relative change vectors
-        explanation_norm = np.linalg.norm(explanation_relative, ord=p_norm)
-        representation_norm = np.linalg.norm(representation_relative, ord=p_norm)
-
-        # Compute RRS ratio
-        instability_ratio = explanation_norm / max(representation_norm, epsilon_min)
-        max_instability = max(max_instability, instability_ratio)
-
-    return float(max_instability)
-
-
-def compute_relative_representation_stability(model, x_sample, explanation_function,
                                             representation_layer, n_samples=20,
                                             noise_std=0.05, epsilon_min=1e-3, p_norm=2):  # Increased epsilon_min
     """
@@ -1010,6 +980,73 @@ def compute_relative_representation_stability(model, x_sample, explanation_funct
         max_instability = max(max_instability, instability_ratio)
 
     return float(max_instability)
+
+def compute_relative_representation_stability(model, x_sample, explanation_function,
+                                            representation_layer, n_samples=50,  # Changed to match paper
+                                            noise_std=0.05, epsilon_min=1e-8, p_norm=2):
+    """
+    Compute Relative Representation Stability (RRS) according to Equation 3.
+    
+    RRS = max ||(ex'-ex)/ex||_p / max(||(Lx'-Lx)/Lx||_p, ε_min)
+    """
+    x_sample = np.array(x_sample).flatten()
+
+    # Get original explanation and representation
+    original_explanation = np.array(explanation_function(x_sample)).flatten()
+    original_representation = np.array(representation_layer(x_sample)).flatten()
+
+    # Generate perturbations with same prediction
+    valid_perturbations = []
+    original_pred = np.argmax(model(x_sample.reshape(1, -1))[0])
+
+    attempts = 0
+    max_attempts = n_samples * 10
+
+    while len(valid_perturbations) < n_samples and attempts < max_attempts:
+        perturbation = np.random.normal(0, noise_std, x_sample.shape)
+        x_perturbed = x_sample + perturbation
+
+        # Check if prediction class is the same
+        perturbed_pred = np.argmax(model(x_perturbed.reshape(1, -1))[0])
+
+        if perturbed_pred == original_pred:
+            # Get representation for perturbed input
+            perturbed_representation = np.array(representation_layer(x_perturbed)).flatten()
+            valid_perturbations.append((x_perturbed, perturbed_representation))
+
+        attempts += 1
+
+    if len(valid_perturbations) == 0:
+        return 0.0
+
+    max_instability = 0.0
+
+    for x_perturbed, perturbed_representation in valid_perturbations:
+        # Get explanation for perturbed input
+        perturbed_explanation = np.array(explanation_function(x_perturbed)).flatten()
+
+        # CORRECTED: Compute (ex' - ex) / ex (percent change in explanations)
+        explanation_diff = perturbed_explanation - original_explanation
+        safe_original_exp = np.where(np.abs(original_explanation) < epsilon_min,
+                                   epsilon_min, original_explanation)
+        explanation_relative = explanation_diff / safe_original_exp
+
+        # CORRECTED: Compute (Lx' - Lx) / Lx (percent change in representations)
+        representation_diff = perturbed_representation - original_representation
+        safe_original_rep = np.where(np.abs(original_representation) < epsilon_min,
+                                   epsilon_min, original_representation)
+        representation_relative = representation_diff / safe_original_rep
+
+        # Compute norms of the relative change vectors
+        explanation_norm = np.linalg.norm(explanation_relative, ord=p_norm)
+        representation_norm = np.linalg.norm(representation_relative, ord=p_norm)
+
+        # Compute RRS ratio
+        instability_ratio = explanation_norm / max(representation_norm, epsilon_min)
+        max_instability = max(max_instability, instability_ratio)
+
+    return float(max_instability)
+
 
 
 def compute_faithfulness(model, x_sample, explanation_function,
@@ -1754,6 +1791,25 @@ def compute_unambiguity_score(model, x_samples, explanation_function,
     unambiguity_score = 1.0 - overlap_results['overlap_rate']
 
     return float(unambiguity_score)
+
+
+import numpy as np
+import pandas as pd
+import os
+import pickle
+import joblib
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder, StandardScaler
+import tensorflow as tf
+from tensorflow.keras.models import load_model
+import shap
+import lime
+from lime.lime_tabular import LimeTabularExplainer
+from interpret.glassbox import ExplainableBoostingClassifier
+import matplotlib.pyplot as plt
+from tabular_metrics import *
+import warnings
+warnings.filterwarnings('ignore')
 
 
 
